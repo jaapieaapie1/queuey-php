@@ -7,9 +7,10 @@ name: Release
 # Packagist reads versions straight from the repository's tags, so there is nothing to
 # upload. The first run registers the package on Packagist if it does not exist yet.
 #
-# Secrets: PACKAGIST_USERNAME and PACKAGIST_TOKEN (packagist.org > Profile > API Token).
+# Secrets (optional): PACKAGIST_USERNAME and PACKAGIST_TOKEN (packagist.org > Profile > API Token).
 # Registering a package needs the MAIN token; once the package exists, the SAFE token is
-# enough for the update call and is the one to keep here.
+# enough for the update call and is the one to keep here. Without them both Packagist
+# steps are skipped and Packagist's GitHub integration picks the tag up on its own.
 
 on:
   push:
@@ -61,6 +62,10 @@ jobs:
     concurrency:
       group: publish
       cancel-in-progress: false
+    # Job-level, because a step's `if` cannot read secrets or its own env.
+    env:
+      PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+      PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -90,9 +95,7 @@ jobs:
             --notes-file "$RUNNER_TEMP/notes.md"
 
       - name: Register the package on Packagist if it is new
-        env:
-          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
-          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        if: env.PACKAGIST_TOKEN != ''
         run: |
           status="$(curl -s -o /dev/null -w '%{http_code}' "https://packagist.org/packages/$PACKAGE.json")"
           if [ "$status" = 200 ]; then
@@ -106,9 +109,7 @@ jobs:
             -d "{\"repository\":\"$REPOSITORY_URL\"}"
 
       - name: Ask Packagist to update the package
-        env:
-          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
-          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        if: env.PACKAGIST_TOKEN != ''
         run: |
           curl -sS --fail-with-body -X POST https://packagist.org/api/update-package \
             -H "Authorization: Bearer $PACKAGIST_USERNAME:$PACKAGIST_TOKEN" \
