@@ -1,0 +1,45 @@
+# Standalone on purpose: this crate lives inside the queuey-php repository but is
+# built against the queuey sources next door, and it must not be pulled into
+# either repository's workspace. The empty `[workspace]` table stops cargo
+# walking up the tree looking for one.
+[workspace]
+
+[package]
+name = "queuey-interop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Rust half of the queuey / queuey-php cross-language interop harness"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "queuey-interop"
+path = "src/main.rs"
+
+[dependencies]
+queuey = { path = "../../../queuey/crates/queuey" }
+
+lapin = "4"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "sync",
+  "time",
+] }
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` so every line this harness prints keeps the key order it was
+# written in ("event" first, then the fields in the order the protocol table
+# documents), and so a body read back off the wire is reported in the order the
+# producer actually wrote it instead of alphabetically. That makes Rust and PHP
+# harness output diffable line by line. It also makes queuey serialize this
+# binary's payload objects in struct-declaration order rather than sorted — see
+# the note in README.md.
+serde_json = { version = "1", features = ["preserve_order"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `StreamExt::next` for the raw `lapin::Consumer` in `drain-dead`. Already in the
+# tree via queuey-rabbitmq, so it costs nothing extra to build.
+futures = "0.3"

@@ -1,0 +1,885 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * `queuey-interop`: the PHP half of the queuey / queuey-php interop harness.
+ *
+ * One script, five subcommands, one broker — the exact mirror of
+ * `interop/rust/src/main.rs`. Two of them (`produce`, `consume`) go through the
+ * queuey-php API and are the thing under test; three (`purge`, `drain-dead`,
+ * `inspect`) go straight to RabbitMQ through php-amqplib and are the harness's
+ * way of checking what was actually left on the wire.
+ *
+ * **stdout carries JSON lines and nothing else.** One object per line, no pretty
+ * printing, no banner, no trailing summary, so a test on either side of the
+ * language boundary can read it with a line-by-line JSON parser. Every
+ * diagnostic — log output, error text, timeout messages — goes to stderr.
+ *
+ * The broker comes from `AMQP_URL`, defaulting to
+ * `amqp://guest:guest@localhost:5672/%2f`. Log level comes from `QUEUEY_LOG`,
+ * defaulting to `info`.
+ */
+
+namespace Queuey\Interop\Cli;
+
+use PhpAmqpLib\Channel\AMQPChannel;
+use PhpAmqpLib\Connection\AbstractConnection;
+use PhpAmqpLib\Connection\AMQPSSLConnection;
+use PhpAmqpLib\Connection\AMQPStreamConnection;
+use PhpAmqpLib\Exception\AMQPProtocolChannelException;
+use PhpAmqpLib\Exception\AMQPTimeoutException;
+use PhpAmqpLib\Message\AMQPMessage;
+use PhpAmqpLib\Wire\AMQPTable;
+use Psr\Log\AbstractLogger;
+use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
+use Queuey\DeadLetter;
+use Queuey\Duration;
+use Queuey\EnqueueOptions;
+use Queuey\Exception\FatalFailure;
+use Queuey\Exception\JobDeferred;
+use Queuey\Exception\RetryableFailure;
+use Queuey\FnDeadLetterHook;
+use Queuey\FnHandler;
+use Queuey\Interop\EchoJob;
+use Queuey\Interop\InteropQueues;
+use Queuey\JobContext;
+use Queuey\Producer;
+use Queuey\RabbitMq\AmqpUrl;
+use Queuey\RabbitMq\RabbitMqBackend;
+use Queuey\Worker;
+use Queuey\WorkerHandle;
+
+// stdout is JSON lines and nothing else, so PHP's own diagnostics have to go
+// the same way the logger does. The CLI SAPI writes them to stdout by default.
+ini_set('display_errors', 'stderr');
+
+require_once __DIR__ . '/bootstrap.php';
+
+/** Broker to talk to when `AMQP_URL` is not set. */
+const DEFAULT_URL = 'amqp://guest:guest@localhost:5672/%2f';
+
+/** The main work queue both languages declare. */
+const MAIN_QUEUE = 'interop.jobs';
+
+/** Its dead-letter companion. */
+const DEAD_QUEUE = 'interop.jobs.dead';
+
+/** Headers the harness reports on every dead message, present or not. */
+const REPORTED_HEADERS = [
+    'x-death-reason',
+    'x-original-queue',
+    'x-attempts',
+    'x-attempt',
+    'x-deferrals',
+];
+
+/** AMQP reply code for a clean `close`. */
+const REPLY_SUCCESS = 200;
+
+/** Exit code clap uses for a usage error, mirrored so the two CLIs agree. */
+const EXIT_USAGE = 2;
+
+/**
+ * Write one JSON object to stdout, on its own line.
+ *
+ * Flushed explicitly, so a test reading this process's pipe sees each event as
+ * it happens rather than all of them at exit.
+ *
+ * @param array<string, mixed> $value
+ */
+function emit(array $value): void
+{
+    $json = json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    fwrite(STDOUT, $json . "\n");
+    fflush(STDOUT);
+}
+
+/** Anything that is not a JSON event line. */
+function warn(string $message): void
+{
+    fwrite(STDERR, $message . "\n");
+}
+
+/**
+ * PSR-3 to stderr, honouring `QUEUEY_LOG` (`debug`, `info`, `warn`/`warning`,
+ * `error`), defaulting to `info`.
+ *
+ * Deliberately tiny: the harness needs a log that cannot pollute stdout, not a
+ * logging framework.
+ */
+final class StderrLogger extends AbstractLogger
+{
+    /** Severity of every PSR-3 level, low to high. */
+    private const SEVERITY = [
+        LogLevel::DEBUG => 0,
+        LogLevel::INFO => 1,
+        LogLevel::NOTICE => 1,
+        LogLevel::WARNING => 2,
+        LogLevel::ERROR => 3,
+        LogLevel::CRITICAL => 3,
+        LogLevel::ALERT => 3,
+        LogLevel::EMERGENCY => 3,
+    ];
+
+    private function __construct(private readonly int $threshold) {}
+
+    /** The logger `QUEUEY_LOG` asks for. */
+    public static function fromEnvironment(): self
+    {
+        $level = strtolower(trim((string) getenv('QUEUEY_LOG')));
+
+        return new self(match ($level) {
+            'debug', 'trace' => 0,
+            '', 'info' => 1,
+            'warn', 'warning' => 2,
+            'error' => 3,
+            default => 1,
+        });
+    }
+
+    /**
+     * @param array<array-key, mixed> $context
+     */
+    public function log(mixed $level, string|\Stringable $message, array $context = []): void
+    {
+        // PSR-3 types `$level` as `mixed`; anything that is not one of the
+        // eight level strings is treated as `info` rather than dropped.
+        $name = \is_string($level) ? $level : LogLevel::INFO;
+        $severity = self::SEVERITY[$name] ?? 1;
+        if ($severity < $this->threshold) {
+            return;
+        }
+
+        $line = \sprintf('%s %s', strtoupper($name), $message);
+        if ($context !== []) {
+            $line .= ' ' . (json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR) ?: '{}');
+        }
+
+        fwrite(STDERR, $line . "\n");
+    }
+}
+
+/**
+ * Counts jobs that will never be seen again: successes plus dead letters.
+ *
+ * `consume --expect N` stops once this reaches `N`, which is why both the
+ * handler and the dead-letter hook bump it. The handle is attached after the
+ * worker is built, so reaching the target shuts the worker down from inside the
+ * delivery that got there rather than up to a poll interval later.
+ */
+final class Terminals
+{
+    private int $count = 0;
+
+    private ?WorkerHandle $handle = null;
+
+    public function __construct(private readonly int $expect) {}
+
+    public function shutDownWith(WorkerHandle $handle): void
+    {
+        $this->handle = $handle;
+    }
+
+    /** One more job has reached a terminal state. */
+    public function bump(): void
+    {
+        ++$this->count;
+        if ($this->count >= $this->expect) {
+            $this->handle?->shutdown();
+        }
+    }
+
+    /** How many have so far. */
+    public function count(): int
+    {
+        return $this->count;
+    }
+}
+
+/**
+ * The flags of one subcommand, parsed from `argv`.
+ *
+ * Accepts `--flag value` and `--flag=value`; a flag declared `bool` takes no
+ * value. Unknown flags, missing values and missing required flags are usage
+ * errors, reported on stderr with exit code 2, the way clap reports them.
+ */
+final class Flags
+{
+    /**
+     * @param array<string, bool|int|string|null> $values
+     */
+    private function __construct(private readonly array $values) {}
+
+    /**
+     * @param list<string>                                                             $arguments
+     * @param array<string, array{type: string, default?: bool|int|string|null, required?: bool}> $spec
+     */
+    public static function parse(string $command, array $arguments, array $spec): self
+    {
+        $values = [];
+        foreach ($spec as $name => $definition) {
+            $values[$name] = $definition['default'] ?? ($definition['type'] === 'bool' ? false : null);
+        }
+
+        $count = \count($arguments);
+        for ($i = 0; $i < $count; ++$i) {
+            $argument = $arguments[$i];
+            if (!str_starts_with($argument, '--')) {
+                usage(\sprintf('%s: unexpected argument `%s`', $command, $argument));
+            }
+
+            $inline = null;
+            $name = substr($argument, 2);
+            if (str_contains($name, '=')) {
+                [$name, $inline] = explode('=', $name, 2);
+            }
+
+            if (!isset($spec[$name])) {
+                usage(\sprintf('%s: unknown flag `--%s`', $command, $name));
+            }
+
+            if ($spec[$name]['type'] === 'bool') {
+                if ($inline !== null) {
+                    usage(\sprintf('%s: `--%s` takes no value', $command, $name));
+                }
+                $values[$name] = true;
+
+                continue;
+            }
+
+            if ($inline === null) {
+                if ($i + 1 >= $count) {
+                    usage(\sprintf('%s: `--%s` needs a value', $command, $name));
+                }
+                $inline = $arguments[++$i];
+            }
+
+            $values[$name] = $spec[$name]['type'] === 'int'
+                ? self::integer($command, $name, $inline)
+                : $inline;
+        }
+
+        foreach ($spec as $name => $definition) {
+            if (($definition['required'] ?? false) && $values[$name] === null) {
+                usage(\sprintf('%s: `--%s` is required', $command, $name));
+            }
+        }
+
+        return new self($values);
+    }
+
+    public function int(string $name): int
+    {
+        $value = $this->values[$name];
+
+        return \is_int($value) ? $value : 0;
+    }
+
+    public function intOrNull(string $name): ?int
+    {
+        $value = $this->values[$name];
+
+        return \is_int($value) ? $value : null;
+    }
+
+    public function string(string $name): string
+    {
+        $value = $this->values[$name];
+
+        return \is_string($value) ? $value : '';
+    }
+
+    public function stringOrNull(string $name): ?string
+    {
+        $value = $this->values[$name];
+
+        return \is_string($value) ? $value : null;
+    }
+
+    public function bool(string $name): bool
+    {
+        return $this->values[$name] === true;
+    }
+
+    private static function integer(string $command, string $name, string $text): int
+    {
+        if (preg_match('/^-?\d+$/', $text) !== 1) {
+            usage(\sprintf('%s: `--%s` expects an integer, got `%s`', $command, $name, $text));
+        }
+
+        return (int) $text;
+    }
+}
+
+/** Report a usage error the way clap does — stderr, exit code 2 — and stop. */
+function usage(string $message): never
+{
+    warn('queuey-interop: ' . $message);
+    warn('usage: queuey-interop <produce|consume|purge|drain-dead|inspect> [flags]');
+    exit(EXIT_USAGE);
+}
+
+// ---------------------------------------------------------------------------
+// produce / consume — through the queuey-php API, the thing under test
+// ---------------------------------------------------------------------------
+
+/**
+ * Declare the topology and enqueue `--count` jobs.
+ *
+ * `new Producer(...)` is what declares `interop.jobs` and `interop.jobs.dead`,
+ * so this is also the command that creates the queues a Rust consumer binds to.
+ *
+ * @param list<string> $arguments
+ */
+function produce(string $url, array $arguments, LoggerInterface $logger): int
+{
+    $flags = Flags::parse('produce', $arguments, [
+        'count' => ['type' => 'int', 'required' => true],
+        'start-seq' => ['type' => 'int', 'default' => 0],
+        'text' => ['type' => 'string', 'default' => 'hello'],
+        'fail-times' => ['type' => 'int', 'default' => 0],
+        'fatal' => ['type' => 'bool'],
+        'defer-once-ms' => ['type' => 'int', 'default' => 0],
+        'correlation-id' => ['type' => 'string'],
+        'after-ms' => ['type' => 'int'],
+        'defer-ms' => ['type' => 'int'],
+    ]);
+
+    $afterMs = $flags->intOrNull('after-ms');
+    $deferMs = $flags->intOrNull('defer-ms');
+    if ($afterMs !== null && $deferMs !== null) {
+        usage('produce: `--after-ms` and `--defer-ms` are mutually exclusive');
+    }
+    $correlationId = $flags->stringOrNull('correlation-id');
+
+    $backend = RabbitMqBackend::connect($url, null, $logger);
+    $producer = new Producer(InteropQueues::class, $backend, $logger);
+
+    for ($offset = 0; $offset < $flags->int('count'); ++$offset) {
+        $job = new EchoJob(
+            seq: $flags->int('start-seq') + $offset,
+            text: $flags->string('text'),
+            failTimes: $flags->int('fail-times'),
+            fatal: $flags->bool('fatal'),
+            deferOnceMs: $flags->int('defer-once-ms'),
+        );
+
+        // `enqueue($job, $options)` is the general form the other two are
+        // shorthands for, and the only one that takes a correlation id — so the
+        // plain methods are used when there is none, which keeps them covered.
+        if ($correlationId !== null) {
+            $options = match (true) {
+                $afterMs !== null => EnqueueOptions::after(Duration::ms($afterMs)),
+                $deferMs !== null => EnqueueOptions::deferred(Duration::ms($deferMs)),
+                default => EnqueueOptions::now(),
+            };
+            $jobId = $producer->enqueue($job, $options->withCorrelationId($correlationId));
+        } elseif ($afterMs !== null) {
+            $jobId = $producer->enqueueAfter($job, Duration::ms($afterMs));
+        } elseif ($deferMs !== null) {
+            $jobId = $producer->defer($job, Duration::ms($deferMs));
+        } else {
+            $jobId = $producer->enqueue($job);
+        }
+
+        emit([
+            'event' => 'enqueued',
+            'seq' => $job->seq,
+            'job_id' => $jobId,
+        ]);
+    }
+
+    // Nothing else in this process wants the connection, and the test that runs
+    // it wants the process gone.
+    $backend->close();
+
+    return 0;
+}
+
+/**
+ * Run a worker until `--expect` jobs have reached a terminal state.
+ *
+ * Terminal means "will never be seen again": a success, or a dead letter of any
+ * cause. A retry and a deferral are not terminal, which is why the `attempt`
+ * lines are reported but not counted.
+ *
+ * @param list<string> $arguments
+ */
+function consume(string $url, array $arguments, LoggerInterface $logger): int
+{
+    $flags = Flags::parse('consume', $arguments, [
+        'expect' => ['type' => 'int', 'required' => true],
+        'timeout-secs' => ['type' => 'int', 'default' => 60],
+    ]);
+
+    $expect = $flags->int('expect');
+    $timeoutSecs = $flags->int('timeout-secs');
+
+    $backend = RabbitMqBackend::connect($url, null, $logger);
+    $terminals = new Terminals($expect);
+
+    $worker = Worker::builder(InteropQueues::class, $backend)
+        // This process exists to run the worker; let it close the connection.
+        ->closeBackendOnShutdown(true)
+        ->logger($logger)
+        ->handler(FnHandler::for(EchoJob::class, static function (EchoJob $job, JobContext $ctx) use ($terminals): void {
+            // The order of these three tests is part of the protocol: a job that
+            // is both `fatal` and `deferOnceMs` dies rather than waiting.
+            if ($job->fatal) {
+                emit(attemptEvent($job, $ctx, 'fatal'));
+
+                throw FatalFailure::withMessage('fatal by request');
+            }
+
+            if ($job->deferOnceMs > 0 && $ctx->deferrals === 0) {
+                emit(attemptEvent($job, $ctx, 'deferred'));
+
+                throw JobDeferred::for(Duration::ms($job->deferOnceMs), 'deferred by request');
+            }
+
+            if ($ctx->attempt <= $job->failTimes) {
+                emit(attemptEvent($job, $ctx, 'retryable'));
+
+                throw RetryableFailure::withMessage('flaky by request');
+            }
+
+            emit(handledEvent($job, $ctx));
+            $terminals->bump();
+        }))
+        ->onDeadLetter(FnDeadLetterHook::for(static function (DeadLetter $dead) use ($terminals): void {
+            emit(deadEvent($dead));
+            $terminals->bump();
+        }))
+        ->build();
+
+    $handle = $worker->handle();
+    $terminals->shutDownWith($handle);
+
+    // The handler shuts the worker down the moment the target is reached; this
+    // stop condition only exists to bound a run that never gets there.
+    $deadline = microtime(true) + $timeoutSecs;
+    $worker->runUntil(static fn(): bool => microtime(true) >= $deadline);
+
+    $settleFailures = $handle->settleFailures();
+    if ($settleFailures > 0) {
+        $logger->warning('outcomes the worker could not report', ['settle_failures' => $settleFailures]);
+    }
+
+    if ($terminals->count() < $expect) {
+        warn(\sprintf(
+            'timed out after %ds with %d of %d terminal events',
+            $timeoutSecs,
+            $terminals->count(),
+            $expect,
+        ));
+
+        return 1;
+    }
+
+    return 0;
+}
+
+/**
+ * `{"event":"attempt",...}`: one line per attempt that did not succeed.
+ *
+ * @return array<string, mixed>
+ */
+function attemptEvent(EchoJob $job, JobContext $ctx, string $outcome): array
+{
+    return [
+        'event' => 'attempt',
+        'seq' => $job->seq,
+        'attempt' => $ctx->attempt,
+        'deferrals' => $ctx->deferrals,
+        'outcome' => $outcome,
+    ];
+}
+
+/**
+ * `{"event":"handled",...}`: one line per job that finally ran.
+ *
+ * @return array<string, mixed>
+ */
+function handledEvent(EchoJob $job, JobContext $ctx): array
+{
+    return [
+        'event' => 'handled',
+        'seq' => $job->seq,
+        'job_id' => $ctx->jobId,
+        'attempt' => $ctx->attempt,
+        'max_attempts' => $ctx->maxAttempts,
+        'deferrals' => $ctx->deferrals,
+        'priority' => $ctx->priority,
+        'correlation_id' => $ctx->correlationId,
+        'age_ms' => $ctx->age->toMs(),
+    ];
+}
+
+/**
+ * `{"event":"dead",...}`: one line per job the worker gave up on, whatever the
+ * cause — including the ones no handler ever saw.
+ *
+ * @return array<string, mixed>
+ */
+function deadEvent(DeadLetter $dead): array
+{
+    return [
+        'event' => 'dead',
+        'job_id' => $dead->envelope->jobId,
+        'job_type' => $dead->envelope->jobType,
+        'cause' => $dead->cause->name,
+        'reason' => $dead->reason,
+        'attempts' => $dead->attempts(),
+        'max_attempts' => $dead->maxAttempts,
+        'seq' => seqOf($dead->envelope->payload),
+    ];
+}
+
+/**
+ * The `seq` of a payload the worker may never have decoded (a `NoHandler` or a
+ * `Decode` dead letter still carries raw JSON), or `null`.
+ */
+function seqOf(mixed $payload): ?int
+{
+    if ($payload instanceof \stdClass) {
+        $payload = get_object_vars($payload);
+    }
+    if (!\is_array($payload)) {
+        return null;
+    }
+
+    $seq = $payload['seq'] ?? null;
+
+    return \is_int($seq) && $seq >= 0 ? $seq : null;
+}
+
+// ---------------------------------------------------------------------------
+// purge / drain-dead / inspect — straight to the broker, no queuey types
+// ---------------------------------------------------------------------------
+
+/**
+ * Delete `interop.jobs` and `interop.jobs.dead`, so the next run starts from a
+ * broker that has never heard of either.
+ *
+ * Deleting a queue that is not there is not an error in RabbitMQ 3.x and later,
+ * but a broker that *did* answer `404 NOT_FOUND` would close the channel
+ * underneath us, so each delete gets a channel of its own and a missing queue is
+ * reported rather than propagated.
+ *
+ * Hold queues (`interop.jobs.deferred.*`) are left alone: they carry `x-expires`
+ * and delete themselves.
+ */
+function purge(string $url): int
+{
+    $connection = rawConnection($url);
+
+    foreach ([MAIN_QUEUE, DEAD_QUEUE] as $name) {
+        $channel = $connection->channel();
+        try {
+            $messages = $channel->queue_delete($name, false, false, false);
+            emit([
+                'event' => 'purged',
+                'name' => $name,
+                'messages' => \is_int($messages) ? $messages : 0,
+            ]);
+        } catch (AMQPProtocolChannelException $error) {
+            if ($error->getCode() !== 404) {
+                throw $error;
+            }
+            emit(['event' => 'missing', 'name' => $name]);
+        }
+
+        closeQuietly($channel);
+    }
+
+    $connection->close();
+
+    return 0;
+}
+
+/**
+ * Consume and ack `--expect` messages off `interop.jobs.dead`, reporting the
+ * full AMQP shape of each: properties, the five headers the spec pins, and the
+ * body — which is the point. It shows what queuey-php actually put on the wire,
+ * not what the library says it did.
+ *
+ * @param list<string> $arguments
+ */
+function drainDead(string $url, array $arguments): int
+{
+    $flags = Flags::parse('drain-dead', $arguments, [
+        'expect' => ['type' => 'int', 'required' => true],
+        'timeout-secs' => ['type' => 'int', 'default' => 30],
+    ]);
+
+    $expect = $flags->int('expect');
+    $timeoutSecs = $flags->int('timeout-secs');
+
+    $connection = rawConnection($url);
+    $channel = $connection->channel();
+    $channel->basic_qos(0, 50, false);
+
+    $drained = 0;
+    // No passive declare first: the queue is either there (queuey declared it)
+    // or this is a test failure worth seeing as a consume error.
+    $channel->basic_consume(
+        DEAD_QUEUE,
+        'queuey-interop-php-drain',
+        false,
+        false,
+        false,
+        false,
+        static function (AMQPMessage $message) use (&$drained): void {
+            emit(deadMessageEvent($message));
+            $message->ack();
+            ++$drained;
+        },
+    );
+
+    $deadline = microtime(true) + $timeoutSecs;
+    $cancelled = false;
+    while ($drained < $expect) {
+        if (!$channel->is_consuming()) {
+            // The consumer was cancelled (the queue was deleted underneath us,
+            // say); stop rather than spin.
+            $cancelled = true;
+
+            break;
+        }
+
+        $remaining = $deadline - microtime(true);
+        if ($remaining <= 0) {
+            break;
+        }
+
+        try {
+            $channel->wait(null, false, min($remaining, 1.0));
+        } catch (AMQPTimeoutException) {
+            continue;
+        }
+    }
+
+    $code = 0;
+    if ($drained < $expect) {
+        $code = 1;
+        warn($cancelled
+            ? \sprintf('consumer cancelled after %d of %d dead messages', $drained, $expect)
+            : \sprintf(
+                'timed out after %ds with %d of %d dead messages on %s',
+                $timeoutSecs,
+                $drained,
+                $expect,
+                DEAD_QUEUE,
+            ));
+    }
+
+    closeQuietly($channel);
+    $connection->close();
+
+    return $code;
+}
+
+/**
+ * Report the depth and consumer count of both interop queues, without declaring
+ * anything: `passive = true` asks about a queue and never creates it.
+ *
+ * A passive declare of a missing queue is a `404 NOT_FOUND`, which closes the
+ * channel it ran on, so each queue gets its own channel.
+ */
+function inspect(string $url): int
+{
+    $connection = rawConnection($url);
+
+    foreach ([MAIN_QUEUE, DEAD_QUEUE] as $name) {
+        $channel = $connection->channel();
+        try {
+            // `queue_declare` answers `[name, message count, consumer count]`.
+            $reply = $channel->queue_declare($name, true, false, false, false, false, []);
+            $declared = \is_array($reply) ? $reply : [];
+            emit([
+                'event' => 'queue',
+                'name' => $name,
+                'messages' => integerAt($declared, 1),
+                'consumers' => integerAt($declared, 2),
+            ]);
+        } catch (AMQPProtocolChannelException $error) {
+            if ($error->getCode() !== 404) {
+                throw $error;
+            }
+            emit(['event' => 'missing', 'name' => $name]);
+        }
+
+        closeQuietly($channel);
+    }
+
+    $connection->close();
+
+    return 0;
+}
+
+/**
+ * `{"event":"dead_message",...}`: everything about one message on `q.dead`.
+ *
+ * `job_id` is the AMQP `message_id` and `type` is the AMQP `type` property; both
+ * are `null` when absent (a malformed-envelope forward sets neither). The five
+ * headers are always present as keys, `null` when the message does not carry
+ * them.
+ *
+ * @return array<string, mixed>
+ */
+function deadMessageEvent(AMQPMessage $message): array
+{
+    $properties = $message->get_properties();
+    $headers = $properties['application_headers'] ?? null;
+    $native = $headers instanceof AMQPTable ? $headers->getNativeData() : [];
+
+    $reported = [];
+    foreach (REPORTED_HEADERS as $key) {
+        $reported[$key] = \is_array($native) ? ($native[$key] ?? null) : null;
+    }
+
+    return [
+        'event' => 'dead_message',
+        'job_id' => property($properties, 'message_id'),
+        'type' => property($properties, 'type'),
+        'content_type' => property($properties, 'content_type'),
+        'delivery_mode' => integerProperty($properties, 'delivery_mode'),
+        'priority' => integerProperty($properties, 'priority'),
+        'headers' => (object) $reported,
+        'body' => bodyToJson($message->getBody()),
+    ];
+}
+
+/**
+ * @param array<array-key, mixed> $properties
+ */
+function property(array $properties, string $name): ?string
+{
+    $value = $properties[$name] ?? null;
+
+    return \is_string($value) ? $value : null;
+}
+
+/**
+ * @param array<array-key, mixed> $properties
+ */
+function integerProperty(array $properties, string $name): ?int
+{
+    $value = $properties[$name] ?? null;
+
+    return is_numeric($value) ? (int) $value : null;
+}
+
+/**
+ * One position of a php-amqplib reply tuple as an integer, `0` when it is
+ * missing or not a number.
+ *
+ * @param array<array-key, mixed> $values
+ */
+function integerAt(array $values, int $index): int
+{
+    $value = $values[$index] ?? null;
+
+    return is_numeric($value) ? (int) $value : 0;
+}
+
+/**
+ * The message body as JSON when it parses, and as a JSON *string* when it does
+ * not — a malformed-envelope dead letter is forwarded verbatim, so the harness
+ * has to be able to report bytes that are not JSON at all.
+ *
+ * Decoded to `stdClass` rather than an array, so an object stays an object and
+ * keeps the key order the producer wrote it in.
+ */
+function bodyToJson(string $body): mixed
+{
+    try {
+        return json_decode($body, false, 512, JSON_THROW_ON_ERROR);
+    } catch (\JsonException) {
+        return $body;
+    }
+}
+
+/** A plain php-amqplib connection, owing nothing to the backend under test. */
+function rawConnection(string $url): AbstractConnection
+{
+    $parsed = AmqpUrl::parse($url);
+
+    if ($parsed->secure) {
+        return new AMQPSSLConnection(
+            $parsed->host,
+            $parsed->port,
+            $parsed->user,
+            $parsed->password,
+            $parsed->vhost,
+            [],
+        );
+    }
+
+    return new AMQPStreamConnection(
+        $parsed->host,
+        $parsed->port,
+        $parsed->user,
+        $parsed->password,
+        $parsed->vhost,
+    );
+}
+
+/**
+ * A channel the broker already closed cannot be closed again; the connection
+ * close tidies up either way, so this is best-effort.
+ */
+function closeQuietly(AMQPChannel $channel): void
+{
+    try {
+        if ($channel->is_open()) {
+            $channel->close();
+        }
+    } catch (\Throwable) {
+        // Nothing to do: the channel is gone, which is what we wanted.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// entry point
+// ---------------------------------------------------------------------------
+
+/**
+ * @param list<string> $argv
+ */
+function main(array $argv): int
+{
+    $command = $argv[1] ?? null;
+    if ($command === null || $command === '--help' || $command === '-h' || $command === 'help') {
+        usage('a subcommand is required');
+    }
+
+    $arguments = \array_slice($argv, 2);
+    $url = (string) (getenv('AMQP_URL') ?: DEFAULT_URL);
+    $logger = StderrLogger::fromEnvironment();
+    $logger->debug('broker', ['url' => $url]);
+
+    try {
+        return match ($command) {
+            'produce' => produce($url, $arguments, $logger),
+            'consume' => consume($url, $arguments, $logger),
+            'purge' => purge($url),
+            'drain-dead' => drainDead($url, $arguments),
+            'inspect' => inspect($url),
+            default => usage(\sprintf('unknown subcommand `%s`', $command)),
+        };
+    } catch (\Throwable $error) {
+        // stderr, not stdout: the contract is that stdout is parseable JSON
+        // lines whatever happens.
+        warn(\sprintf('queuey-interop: %s: %s', $error::class, $error->getMessage()));
+        $logger->error('command failed', ['error' => $error->getMessage()]);
+
+        return 1;
+    }
+}
+
+/** @var list<string> $argv */
+exit(main($argv));

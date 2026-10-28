@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # release.yml runs this workflow as its gate before publishing a tag.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4', '8.5']
+
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+          --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: json, mbstring, pcntl, sockets
+          coverage: none
+          tools: composer:v2
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/composer/files
+          key: composer-${{ matrix.php }}-${{ hashFiles('composer.json') }}
+          restore-keys: composer-${{ matrix.php }}-
+
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-lock
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      # Style, static analysis and the unit tests. No AMQP_URL here on purpose:
+      # the integration suite skips itself, so this step fails only on the code.
+      - name: Check (cs + stan + unit)
+        run: composer check
+
+      - name: Integration tests
+        run: composer test:integration
+        env:
+          AMQP_URL: amqp://guest:guest@localhost:5672/%2f
+
+  interop:
+    name: Cross-language interop
+    runs-on: ubuntu-latest
+
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+          --health-start-period 30s
+
+    steps:
+      # `interop/rust` depends on queuey by path, `../../../queuey/crates/queuey`,
+      # so the two repositories have to be siblings inside the workspace.
+      - name: Check out queuey-php
+        uses: actions/checkout@v4
+        with:
+          path: queuey-php
+
+      - name: Check out queuey (Rust)
+        uses: actions/checkout@v4
+        with:
+          repository: jaapieaapie1/queuey
+          path: queuey
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: json, mbstring, pcntl, sockets
+          coverage: none
+          tools: composer:v2
+
+      - name: Install PHP dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+        working-directory: queuey-php
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: queuey-php/interop/rust
+
+      # run.sh uses jq for its JSON assertions and falls back to a PHP one-liner
+      # without it; install it so CI exercises the path a developer uses.
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Build the Rust half
+        run: cargo build --release
+        working-directory: queuey-php/interop/rust
+
+      - name: Run the interop harness
+        run: interop/run.sh
+        working-directory: queuey-php
+        env:
+          AMQP_URL: amqp://guest:guest@localhost:5672/%2f

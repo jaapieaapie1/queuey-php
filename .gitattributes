@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+# Keep the Composer dist archive to the library itself: tests, the interop harness
+# and development configuration stay in the repository only. docs/ ships because
+# README.md and CHANGELOG.md link to the wire contract in docs/INTEROP-SPEC.md.
+/.editorconfig export-ignore
+/.gitattributes export-ignore
+/.github export-ignore
+/.gitignore export-ignore
+/.php-cs-fixer.dist.php export-ignore
+/interop export-ignore
+/phpstan.neon.dist export-ignore
+/phpunit.xml.dist export-ignore
+/tests export-ignore

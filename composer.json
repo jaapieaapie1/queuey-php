@@ -1,0 +1,76 @@
+{
+    "name": "queuey/queuey",
+    "description": "A pure-PHP job queue with RabbitMQ transport, wire-compatible with the queuey Rust library.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "queue",
+        "jobs",
+        "worker",
+        "rabbitmq",
+        "amqp"
+    ],
+    "homepage": "https://github.com/jaapieaapie1/queuey-php",
+    "authors": [
+        {
+            "name": "Jaap Elst",
+            "homepage": "https://github.com/jaapieaapie1"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/jaapieaapie1/queuey-php/issues",
+        "source": "https://github.com/jaapieaapie1/queuey-php",
+        "docs": "https://github.com/jaapieaapie1/queuey-php/blob/main/README.md"
+    },
+    "require": {
+        "php": "^8.3",
+        "ext-json": "*",
+        "ext-mbstring": "*",
+        "php-amqplib/php-amqplib": "^3.7",
+        "psr/log": "^3"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3",
+        "pestphp/pest": "^4.0",
+        "phpstan/phpstan": "^2"
+    },
+    "autoload": {
+        "psr-4": {
+            "Queuey\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Queuey\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true,
+            "phpstan/extension-installer": true
+        }
+    },
+    "scripts": {
+        "test": "pest",
+        "test:integration": "pest --testsuite Integration",
+        "test:all": "pest --testsuite Unit,Integration",
+        "stan": "phpstan analyse",
+        "cs": "php-cs-fixer fix --dry-run --diff",
+        "cs:fix": "php-cs-fixer fix",
+        "check": [
+            "@cs",
+            "@stan",
+            "@test"
+        ]
+    },
+    "scripts-descriptions": {
+        "test": "Run the unit suite with Pest.",
+        "test:integration": "Run the broker-backed suite with Pest (needs AMQP_URL).",
+        "test:all": "Run both Pest suites.",
+        "stan": "Run PHPStan at level max.",
+        "cs": "Check coding standards without writing.",
+        "cs:fix": "Fix coding standards in place.",
+        "check": "Run cs, stan and the unit suite."
+    }
+}

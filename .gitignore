@@ -1,0 +1,7 @@
+/vendor/
+/.phpunit.cache/
+/.php-cs-fixer.cache
+/.phpunit.result.cache
+# A library does not pin its dependencies: consumers resolve their own versions.
+/composer.lock
+/generated-images/

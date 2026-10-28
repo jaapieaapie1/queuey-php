@@ -1,0 +1,116 @@
+name: Release
+
+# Publishes queuey/queuey when a tag `vX.Y.Z` is pushed. The tag must match the newest
+# released heading in CHANGELOG.md (`## [X.Y.Z] - YYYY-MM-DD`; `[Unreleased]` is skipped),
+# and the full CI workflow has to pass on the tagged commit. The job then creates a GitHub
+# release whose notes are that CHANGELOG section, and tells Packagist about the tag:
+# Packagist reads versions straight from the repository's tags, so there is nothing to
+# upload. The first run registers the package on Packagist if it does not exist yet.
+#
+# Secrets: PACKAGIST_USERNAME and PACKAGIST_TOKEN (packagist.org > Profile > API Token).
+# Registering a package needs the MAIN token; once the package exists, the SAFE token is
+# enough for the update call and is the one to keep here.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  REPOSITORY_URL: https://github.com/jaapieaapie1/queuey-php
+  PACKAGE: queuey/queuey
+
+jobs:
+  version:
+    name: Check the tag against CHANGELOG.md
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag
+        id: check
+        run: |
+          tag="$GITHUB_REF_NAME"
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "::error::tag $tag is not of the form vX.Y.Z"
+            exit 1
+          }
+          version="${tag#v}"
+          latest="$(grep -m1 -oP '^## \[\K[0-9]+\.[0-9]+\.[0-9]+(?=\])' CHANGELOG.md || true)"
+          test "$latest" = "$version" || {
+            echo "::error::tag $tag does not match the newest CHANGELOG.md release '${latest:-none}'"
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: CI
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish ${{ needs.version.outputs.version }}
+    needs: [version, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # The notes are everything between the version's heading and the next `## [`
+      # heading or link reference block.
+      - name: Extract the release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md" || {
+            echo "::error::no CHANGELOG.md section for $VERSION"
+            exit 1
+          }
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+
+      - name: Register the package on Packagist if it is new
+        env:
+          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        run: |
+          status="$(curl -s -o /dev/null -w '%{http_code}' "https://packagist.org/packages/$PACKAGE.json")"
+          if [ "$status" = 200 ]; then
+            echo "$PACKAGE is already on Packagist"
+            exit 0
+          fi
+          test "$status" = 404 || { echo "::error::Packagist answered $status"; exit 1; }
+          curl -sS --fail-with-body -X POST https://packagist.org/api/create-package \
+            -H "Authorization: Bearer $PACKAGIST_USERNAME:$PACKAGIST_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"repository\":\"$REPOSITORY_URL\"}"
+
+      - name: Ask Packagist to update the package
+        env:
+          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        run: |
+          curl -sS --fail-with-body -X POST https://packagist.org/api/update-package \
+            -H "Authorization: Bearer $PACKAGIST_USERNAME:$PACKAGIST_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"repository\":\"$REPOSITORY_URL\"}"
